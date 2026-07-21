@@ -1,0 +1,58 @@
+=== FACTORY PATCH (control / proposed fix) ===
+Apply on top of the singleton (bug) config to switch to per-request router.
+
+--- src/entry-server.tsx	2026-07-21 13:41:06
++++ src/entry-server.tsx	2026-07-21 13:42:30
+@@ -1,13 +1,8 @@
+ // @refresh reload
+ import { createHandler, StartServer } from "@solidjs/start/server";
+ import { createMemoryHistory } from "@tanstack/solid-router";
+-import { router } from "./router";
++import { createRouter } from "./router";
+ 
+-// BUG-REPRODUCING CONFIG: singleton router (the template's current pattern).
+-// `router` is a module-level singleton imported by both entry-server.tsx AND
+-// app.tsx (via RouterProvider). Under concurrent SSR requests with async
+-// route loaders, the shared mutable router state leaks across requests.
+-// See race-test.mjs / cold-burst-test.mjs.
+ export default createHandler(
+   () => (
+     <StartServer
+@@ -27,17 +22,19 @@
+       )}
+     />
+   ),
+-  async (context) => {
++  async (context: any) => {
+     const url = new URL(context.request.url);
+     const path = url.href.replace(url.origin, "");
+ 
+-    router.update({
++    const r = createRouter();
++    (context as any).__router = r;
++    r.update({
+       history: createMemoryHistory({
+         initialEntries: [path]
+       })
+     });
+ 
+-    await router.load();
++    await r.load();
+ 
+     return {};
+   }
+--- src/app.tsx	2026-07-21 13:41:09
++++ src/app.tsx	2026-07-21 13:42:30
+@@ -1,8 +1,11 @@
+ import { router } from "./router";
+ import { RouterProvider } from "@tanstack/solid-router";
++import { getRequestEvent } from "solid-js/web";
+ 
+ import "./app.css";
+ 
+ export default function App() {
+-  return <RouterProvider router={router} />;
++  const evt = getRequestEvent() as any;
++  const r = evt?.__router ?? router;
++  return <RouterProvider router={r} />;
+ }
