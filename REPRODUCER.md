@@ -46,10 +46,44 @@ the same shared router state at the same instant.
 - `src/entry-server.tsx`        — singleton (bug) config, stock Approach A.
 - `src/router.tsx`              — `defaultStaleTime: 0` (forces loader re-run per request; intended to open the warm race window, which did **not** reproduce on stable 2.0.0 — only the cold-start race did).
 - `src/routes/{index,about}.tsx`— async loaders returning distinct, marked data.
+- `src/routes/secret.tsx`       — user-scoped loader: reads `x-user-id` via `getRequestEvent().request.headers` and returns `SECRET-TOKEN-FOR-<user>`. Used to demonstrate **cross-user information disclosure** (see "Security angle" below).
 - `race-test.mjs`               — concurrent-pair test (warm; needs invalidate+sync to open window every request).
 - `cold-burst-test.mjs`         — restarts the server per trial, fires one cold pair (no invalidate/sync needed).
 - `capture-cold-example.mjs`    — starts fresh server, fires one pair, dumps HTML.
+- `leak-test.mjs`               — cold-start cross-user leak test on `/secret` (concurrent `alice`/`bob`); exit 2 on leak.
 - `FACTORY_PATCH.diff`          — the control/fix: switch to per-request factory wired via the request event.
+
+## Security angle: cross-user information disclosure
+
+The shared-state race is not merely "the wrong route renders" — because the
+router holds **request-scoped loader data**, one request's data can be rendered
+into another request's response. `src/routes/secret.tsx` makes this concrete:
+its loader returns `SECRET-TOKEN-FOR-<user>` keyed on the `x-user-id` header.
+
+| mode | request pattern | leak rate |
+|---|---|---|
+| cold-start, concurrent pair (`leak-test.mjs`) | alice + bob hit `/secret` at once, server restart per trial | **15/15 (100%)** |
+| warm, sequential (no concurrency) | alice, then bob, carol, dave on one warm server | **every request after the first** |
+
+In both cases the request that loses the race (or simply arrives later, warm)
+renders the **other user's** secret token. Cold-concurrent example:
+
+```
+alice request (x-user-id: alice) -> rendered user="alice", secret="SECRET-TOKEN-FOR-alice", n=809214741
+bob   request (x-user-id: bob)   -> rendered user="alice", secret="SECRET-TOKEN-FOR-alice", n=809214741   <-- LEAK
+```
+
+```bash
+pnpm build
+node leak-test.mjs 15 3000      # expect 15/15 leak, exit code 2
+```
+
+The fix is the same as the race fix: a **per-request router instance** so no
+request-scoped state is shared (see `FACTORY_PATCH.diff`). Warm caching hides
+the concurrent race but does **not** provide isolation — the warm sequential
+leak above is deterministic.
+
+
 
 ## How to reproduce
 

@@ -44,6 +44,46 @@ After starting the server, request `/` and `/about` individually — both render
 
 The singleton router plus `router.load()` calls `loadMatches` → `Promise.all(loaders)`. During the async yield window, two concurrent requests mutate the same shared store, so one request's matches/data overwrite the other's. The first request to resolve then renders with the wrong route component and loader data.
 
+## Why this matters (security / isolation)
+
+This is not just "the wrong route component renders." Because the shared router state holds **request-scoped data** (loader output), one request's data can be rendered into **another request's response**. The moment a loader reads anything keyed to the request — an `x-user-id` header, a cookie, an auth session, a per-user DB row — that user-specific data can leak into a different user's SSR response. That is a cross-request, and potentially **cross-user, information disclosure**.
+
+The `/secret` route demonstrates this concretely:
+
+- `src/routes/secret.tsx` — the loader reads `x-user-id` via `getRequestEvent().request.headers` and returns `SECRET-TOKEN-FOR-<user>`.
+- `leak-test.mjs` — cold-start, concurrent `alice`/`bob` pair on `/secret`. Reproduces **15/15**: bob's request (sent with `x-user-id: bob`) renders **alice's** secret token. Both responses carry the identical `data-n`, proving they were rendered from one shared loader result. Exit code **2** on leak.
+
+Example raw evidence (cold-start, concurrent pair):
+
+```
+alice request (x-user-id: alice) -> rendered user="alice", secret="SECRET-TOKEN-FOR-alice", n=809214741
+bob   request (x-user-id: bob)   -> rendered user="alice", secret="SECRET-TOKEN-FOR-alice", n=809214741   <-- LEAK
+```
+
+The same root cause also leaks in the **warm sequential** case (no concurrency at all). Once alice's request warms the singleton cache, every subsequent user — even on a quiet, serialized server — receives alice's cached data:
+
+```
+request x-user-id: alice -> rendered SECRET-TOKEN-FOR-alice  (n=44740098)
+request x-user-id: bob   -> rendered SECRET-TOKEN-FOR-alice  (n=44740098)   <-- LEAK
+request x-user-id: carol -> rendered SECRET-TOKEN-FOR-alice  (n=44740098)   <-- LEAK
+request x-user-id: dave  -> rendered SECRET-TOKEN-FOR-alice  (n=44740098)   <-- LEAK
+```
+
+### Root principle
+
+On the server you must never share **request-scoped state** across requests. The router instance — its match cache, loader data, and in-flight loads — is request-scoped. The correct fix is a **fresh router instance per request** (see [`FACTORY_PATCH.diff`](./FACTORY_PATCH.diff)). A module-level singleton is fine for the client (one browser tab = one user), but on the server it is an isolation bug.
+
+### Why "it usually doesn't leak" is not a security property
+
+Warm caching masks the symptom: the loader is not re-run, so the async race window closes and the cold-concurrent contamination above stops firing. But the underlying state is still shared, so the warm sequential leak above takes over — once user A's data is cached, **every** later user gets A's data. "Most requests don't leak" is an availability/timing observation, not an isolation guarantee. For a security property you need per-request state, full stop.
+
+### Reproduce the leak
+
+```bash
+pnpm build
+node leak-test.mjs 15 3000     # cold-start concurrent; expect 15/15 leak, exit code 2
+```
+
 ## Results matrix (stable `@solidjs/start` 2.0.0)
 
 | Scenario | Reproduced / Total |
@@ -52,6 +92,8 @@ The singleton router plus `router.load()` calls `loadMatches` → `Promise.all(l
 | Warm concurrent (`race-test.mjs`, 200 pairs) | 0/200 (0%) |
 | Warm concurrent (independent max-parallel burst) | 0/200 (0%) |
 | Single sequential (baseline) | 0/2 |
+| **Cold-start cross-user leak (`leak-test.mjs`, `/secret`)** | **15/15 (100%)** |
+| **Warm sequential cross-user leak (`/secret`, no concurrency)** | **every request after the first** |
 
 ## Honest caveat (warm)
 
@@ -65,6 +107,8 @@ Originally based on `@solidjs/start` beta.0 (Approach A) so SSR would return 200
 
 - [`REPRODUCER.md`](./REPRODUCER.md) — full write-up and contamination matrix.
 - [`FACTORY_PATCH.diff`](./FACTORY_PATCH.diff) — per-request factory control/fix.
+- [`leak-test.mjs`](./leak-test.mjs) — cold-start cross-user leak test on `/secret` (see "Why this matters" above).
+- [`src/routes/secret.tsx`](./src/routes/secret.tsx) — user-scoped loader (`x-user-id` → `SECRET-TOKEN-FOR-<user>`) used to demonstrate cross-user disclosure.
 - Issue: https://github.com/solidjs/templates/issues/268
 
 ## Environment
