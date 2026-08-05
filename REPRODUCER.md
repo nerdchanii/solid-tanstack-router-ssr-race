@@ -9,13 +9,19 @@ async route loaders are present.
 
 | config                                  | conditions            | contamination        |
 |-----------------------------------------|-----------------------|----------------------|
-| **singleton** (template's pattern)      | cold cache, 15 trials | **15/15 (100%)**     |
+| **singleton** (template's pattern)      | cold cache, 15 trials | **15/15 (100%)** — 30/30 across two runs |
 | **factory** (per-request router)        | cold cache, 15 trials | **0/15 (0%)**        |
-| **singleton** + `invalidate`+`sync`     | warm, 300 pairs       | **300/300 (100%)**   |
-| **factory**  + `invalidate`+`sync`      | warm, 300 pairs       | **0/300 (0%)**       |
+| **singleton** + `invalidate`+`sync`     | warm, 200 pairs       | **0/200 (0%)**       |
+| **factory**  + `invalidate`+`sync`      | warm, 200 pairs       | **0/200 (0%)**       |
 
-Conclusion: the race is in the **singleton**, and the **per-request factory
-eliminates it**.
+Conclusion: on stable 2.0.0 the race is **only deterministic in the cold
+singleton case** — the per-request factory eliminates that cold contamination.
+The warm case shows **no contamination in either config** (0/200 across two
+independent harnesses: `race-test.mjs` at concurrency 20, and a harness-free
+custom max-parallel burst). The earlier warm 300/300 claim (alpha.2 /
+`defaultStaleTime: 5000`) did **not** reproduce on stable 2.0.0
+(`defaultStaleTime: 0`). The cold-start result is the solid, realistic
+reproduction (serverless/edge cold starts).
 
 ## A concrete contamination example (cold cache)
 
@@ -38,7 +44,7 @@ the same shared router state at the same instant.
 ## Files
 
 - `src/entry-server.tsx`        — singleton (bug) config, stock Approach A.
-- `src/router.tsx`              — `staleTime: 0` (forces cold-style loads for the warm test).
+- `src/router.tsx`              — `defaultStaleTime: 0` (forces loader re-run per request; intended to open the warm race window, which did **not** reproduce on stable 2.0.0 — only the cold-start race did).
 - `src/routes/{index,about}.tsx`— async loaders returning distinct, marked data.
 - `race-test.mjs`               — concurrent-pair test (warm; needs invalidate+sync to open window every request).
 - `cold-burst-test.mjs`         — restarts the server per trial, fires one cold pair (no invalidate/sync needed).
@@ -71,11 +77,14 @@ contamination is deterministic.
 The warm-cache case (repeated requests to already-loaded routes) is masked by
 TanStack's match cache: `router.load()` returns the cached match immediately
 without re-running the loader, so the yield window closes and requests are
-effectively serialized on the shared router. (This is why the default
-`staleTime: 5000` template "passes" even under load — the loaders only run
-once.)
+effectively serialized on the shared router. (This is why the **default
+template**, which ships `defaultStaleTime: 5000`, "passes" even under load —
+its loaders only run once. **This repro instead sets `defaultStaleTime: 0`**
+in `src/router.tsx`, yet even then the warm race did **not** reproduce on
+stable 2.0.0 — only the cold-start race did.)
 
 ## Environment
 
-node v24.15.0, pnpm 11.12.0, `@solidjs/start` 2.0.0-alpha.2,
-`@tanstack/solid-router` 1.135.2, darwin 25.5.0.
+node v24.15.0, pnpm 10.28.2, `@solidjs/start` 2.0.0,
+`@tanstack/solid-router` 1.135.2, `vite` 8.2.0, `solid-js` 1.9.10,
+`nitro` 3.0.260610-beta, darwin 25.5.0.
